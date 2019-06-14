@@ -1,7 +1,7 @@
 import numpy as np
 from fastai import *
 from fastai.vision import *
-
+from CircularObject import *
 
 def create_anchors(sizes, ratios, scales, flatten=True):
     "Create anchor of `sizes`, `ratios` and `scales`."
@@ -16,6 +16,20 @@ def create_anchors(sizes, ratios, scales, flatten=True):
         ancs = torch.cat([base_grid.expand(n,a,2), sized_aspects.expand(n,a,2)], 2)
         anchors.append(ancs.view(h,w,a,4))
     return torch.cat([anc.view(-1,4) for anc in anchors],0) if flatten else anchors
+
+def create_circular_anchors(sizes, scales, flatten=True):
+    "Create circular anchor grid of `sizes`, and `scales`."
+    aspects = [[s] for s in scales] 
+    aspects = torch.tensor(aspects)
+    anchors = []
+    for h,w in sizes:
+        #4 here to have the anchors overlap.
+        sized_aspects = 4 * (aspects * torch.tensor([2/h])).unsqueeze(0)
+        base_grid = create_grid((h,w)).unsqueeze(1)
+        n,a = base_grid.size(0),aspects.size(0)
+        ancs = torch.cat([base_grid.expand(n,a,2), sized_aspects.expand(n,a,1)], 2)
+        anchors.append(ancs.view(h,w,a,3))
+    return torch.cat([anc.view(-1,3) for anc in anchors],0) if flatten else anchors
 
 
 def create_grid(size):
@@ -44,6 +58,8 @@ def encode_class(idxs, n_classes):
     return target
 
 
+
+
 def show_anchors(ancs, size):
     _,ax = plt.subplots(1,1, figsize=(5,5))
     ax.set_xticks(np.linspace(-1,1, size[1]+1))
@@ -69,12 +85,40 @@ def show_boxes(boxes):
         draw_rect(ax, rect)
 
 
+def bbox_to_activ(bboxes, anchors, flatten=True):
+
+    "Return the target of the model on `anchors` for the `bboxes`."
+    if flatten:
+        # x and y offsets are normalized by radius
+        t_centers = (bboxes[...,:2] - anchors[...,:2]) / anchors[...,2:]
+        # Radius is given in log scale, relative to anchor radius
+        t_sizes = torch.log(bboxes[...,2:] / anchors[...,2:] + 1e-8)
+        # Finally, everything is divided by 0.1 (radii by 0.2)
+        if (bboxes.shape[-1] == 4):
+            return torch.cat([t_centers, t_sizes], -1).div_(bboxes.new_tensor([[0.1, 0.1, 0.2, 0.2]]))
+        else:
+            return torch.cat([t_centers, t_sizes], -1).div_(bboxes.new_tensor([[0.1, 0.1, 0.2]]))
+
+            
+    else: return [activ_to_bbox(act,anc) for act,anc in zip(acts, anchors)]
+    return res
+
+
+
 def activ_to_bbox(acts, anchors, flatten=True):
     "Extrapolate bounding boxes on anchors from the model activations."
+
     if flatten:
-        acts.mul_(acts.new_tensor([[0.1, 0.1, 0.2, 0.2]]))
-        centers = anchors[...,2:] * acts[...,:2] + anchors[...,:2]
-        sizes = anchors[...,2:] * torch.exp(acts[...,2:])
+
+        if (anchors.shape[-1]==4):
+            acts.mul_(acts.new_tensor([[0.1, 0.1, 0.2, 0.2]]))
+            centers = anchors[...,2:] * acts[...,:2] + anchors[...,:2]
+            sizes = anchors[...,2:] * torch.exp(acts[...,2:])
+
+        else:
+            acts.mul_(acts.new_tensor([[0.1, 0.1, 0.2]]))
+            centers = anchors[...,2:] * acts[...,:2] + anchors[...,:2]
+            sizes = anchors[...,2:] * torch.exp(acts[...,2:])
         return torch.cat([centers, sizes], -1)
     else: return [activ_to_bbox(act,anc) for act,anc in zip(acts, anchors)]
     return res
@@ -96,14 +140,41 @@ def intersection(anchors, targets):
     bot_right_i = torch.min(ancs[...,2:], tgts[...,2:])
     sizes = torch.clamp(bot_right_i - top_left_i, min=0)
     return sizes[...,0] * sizes[...,1]
+   
+
+        
 
 
 def IoU_values(anchors, targets):
     "Compute the IoU values of `anchors` by `targets`."
-    inter = intersection(anchors, targets)
-    anc_sz, tgt_sz = anchors[:,2] * anchors[:,3], targets[:,2] * targets[:,3]
-    union = anc_sz.unsqueeze(1) + tgt_sz.unsqueeze(0) - inter
-    return inter/(union+1e-8)
+    if (anchors.shape[-1]==4):
+
+        inter = intersection(anchors, targets)
+        anc_sz, tgt_sz = anchors[:,2] * anchors[:,3], targets[:,2] * targets[:,3]
+        union = anc_sz.unsqueeze(1) + tgt_sz.unsqueeze(0) - inter
+        
+        return inter/(union+1e-8)
+
+
+    else: #circular anchors
+        a, t = anchors.size(0), targets.size(0)
+        ancs = anchors.unsqueeze(1).expand(a,t,3)
+        tgts = targets.unsqueeze(0).expand(a,t,3)
+        diff = (ancs[:,:,0:2]-tgts[:,:,0:2])
+        distances = (diff**2).sum(dim=2).sqrt()
+        radius1 = ancs[...,2]
+        radius2 = tgts[...,2]
+        acosterm1 = (((distances**2) + (radius1**2) - (radius2**2)) / (2 * distances * radius1)).clamp(-1,1).acos()
+        acosterm2 = (((distances**2) - (radius1**2) + (radius2**2)) / (2 * distances * radius2)).clamp(-1,1).acos()
+        secondterm = ((radius1+radius2-distances)*(distances+radius1-radius2)*(distances+radius1+radius2)*(distances-radius1+radius2)).clamp(min=0).sqrt()
+
+        intersec = (radius1**2 * acosterm1) + (radius2**2 * acosterm2) - (0.5 * secondterm)
+
+        union = np.pi * ((radius1**2) + (radius2**2)) - intersec
+
+        return intersec / (union+1e-8)
+
+    
 
 
 def match_anchors(anchors, targets, match_thr=0.5, bkg_thr=0.4):
@@ -121,14 +192,6 @@ def match_anchors(anchors, targets, match_thr=0.5, bkg_thr=0.4):
     #matches[idxs] = targets.new_tensor(list(range(targets.size(0)))).long()
     return matches
 
-def bbox_to_activ(bboxes, anchors, flatten=True):
-    "Return the target of the model on `anchors` for the `bboxes`."
-    if flatten:
-        t_centers = (bboxes[...,:2] - anchors[...,:2]) / anchors[...,2:]
-        t_sizes = torch.log(bboxes[...,2:] / anchors[...,2:] + 1e-8)
-        return torch.cat([t_centers, t_sizes], -1).div_(bboxes.new_tensor([[0.1, 0.1, 0.2, 0.2]]))
-    else: return [activ_to_bbox(act,anc) for act,anc in zip(acts, anchors)]
-    return res
 
 
 def _draw_outline(o:Patch, lw:int):
@@ -145,6 +208,23 @@ def draw_rect(ax:plt.Axes, b:Collection[int], color:str='white', text=None, text
         _draw_outline(patch,1)
 
 
+def _draw_circ_outline(o:Patch, lw:int):
+    "Outline bounding box onto image `Patch`."
+    o.set_path_effects([patheffects.Stroke(
+        linewidth=lw, foreground='black'), patheffects.Normal()])
+
+def draw_circle(ax:plt.Axes, b:Collection[int], color:str='white', text=None, yoffset=0, text_size=14):
+    "Draw bounding circle on `ax`."
+    b = np.array(b)
+    patch = ax.add_patch(patches.Circle(b[:2], radius=b[-1:], fill=False, edgecolor=color, lw=2))
+    _draw_circ_outline(patch, 4)
+    if text is not None:
+        textcoords = b[:2].copy()
+        textcoords[1] += yoffset
+        patch = ax.text(*textcoords, text, verticalalignment='top', color=color, fontsize=text_size, weight='bold')
+        _draw_circ_outline(patch,1)
+        
+
 def nms(boxes, scores, thresh=0.5):
     idx_sort = scores.argsort(descending=True)
     boxes, scores = boxes[idx_sort], scores[idx_sort]
@@ -159,6 +239,20 @@ def nms(boxes, scores, thresh=0.5):
         boxes, scores, indexes = boxes[mask_keep], scores[mask_keep], indexes[mask_keep]
     return LongTensor(to_keep)
 
+def nms_obj(det:dict, thres=0.5):
+    to_keep = nms(det['bbox_pred'], det['scores'], thresh=thres)
+    for key in ['bbox_pred', 'preds', 'scores']:
+        det[key] = det[key][to_keep]
+    
+    det['to_keep'] = to_keep
+    return det
+#    bbox_pred, preds, scores = det['bbox_pred'][to_keep], preds[to_keep].cpu(), scores[to_keep].cpu()
+    
+def dict_to_cpu(dictType:dict):
+    for k in dictType.keys():
+        if (dictType[k] is not None):
+            dictType[k] = dictType[k].cpu()
+    return dictType
 
 def show_preds(img, bbox_pred, preds, scores, classes, figsize=(5,5)):
 
@@ -207,42 +301,143 @@ def show_results_side_by_side(learn: Learner, anchors, detect_thresh:float=0.2, 
 
 
 def show_results(img, bbox_pred, preds, scores, classes, bbox_gt, preds_gt, figsize=(5,5)
-                 , titleA: str="", titleB: str=""):
+                 , titleA: str="", titleB: str="", titleC: str=None, clas_pred=None, anchors=None, cla2_pred=None):
 
-    _, ax = plt.subplots(nrows=1, ncols=2, figsize=figsize)
+    if anchors is not None:
+        sizes = len(np.unique(anchors[:,2]))
+
+    
+    cols = 2 if clas_pred is None else 2+sizes
+    if (cla2_pred is not None):
+        cols+=1
+    _, ax = plt.subplots(nrows=1, ncols=cols, figsize=figsize)
     ax[0].set_title(titleA)
     ax[1].set_title(titleB)
+    if titleC is not None:
+        ax[2].set_title(titleC)
+        sizes = len(np.unique(anchors[:,2]))
+    if (cla2_pred is not None):
+        ax[3].set_title('CAM 2nd stage')
+
+
     # show prediction
     img.show(ax=ax[1])
     if bbox_pred is not None:
         for bbox, c, scr in zip(bbox_pred, preds, scores):
             txt = str(c.item()) if classes is None else classes[c.item()]
-            draw_rect(ax[1], [bbox[1],bbox[0],bbox[3],bbox[2]], text=f'{txt} {scr:.2f}')
+            if (bbox.shape[-1]==4):
+                draw_rect(ax[1], [bbox[1],bbox[0],bbox[3],bbox[2]], text=f'{txt} {scr:.2f}') 
+            else:
+                draw_circle(ax[1], [bbox[1],bbox[0],bbox[2]], text=f'{txt} {scr:.2f}') 
 
     # show gt
     img.show(ax=ax[0])
     for bbox, c in zip(bbox_gt, preds_gt):
         txt = str(c.item()) if classes is None else classes[c.item()]
-        draw_rect(ax[0], [bbox[1],bbox[0],bbox[3],bbox[2]], text=f'{txt}')
+        if (bbox.shape[-1] == 4):
+            draw_rect(ax[0], [bbox[1],bbox[0],bbox[3],bbox[2]], text=f'{txt}')
+        else:
+            draw_circle(ax[0], [bbox[1],bbox[0],bbox[2]], text=f'{txt}') 
 
-def process_output(clas_pred, bbox_pred, anchors, detect_thresh=0.25):
+
+    if (clas_pred is not None):
+        pred_act = clas_pred[:,0] # only CAM for active class, not for BG
+        splits=1
+        newshape=np.int16(np.sqrt(anchors.shape[0]/splits/sizes)),np.int16(np.sqrt(anchors.shape[0]/splits/sizes))
+
+        for i in range(sizes):
+                im = ax[i+2].imshow(np.reshape(torch.sigmoid(pred_act[i::sizes]), newshape=newshape), vmin=0, vmax=1)
+                plt.colorbar(im, ax=ax[i+2])
+
+    if (cla2_pred is not None):
+        pred_act = cla2_pred[:,0] # only CAM for active class, not for BG
+        splits=1
+        newshape=np.int16(np.sqrt(anchors.shape[0]/splits/sizes)),np.int16(np.sqrt(anchors.shape[0]/splits/sizes))
+
+        for i in range(sizes):
+                im = ax[i+3].imshow(np.reshape(pred_act[i::sizes], newshape=newshape), vmin=0, vmax=1)
+                plt.colorbar(im, ax=ax[i+3] )
+        
+
+def show_results_doubleclass(img, cla1, cla2, bbox_gt, class_gt, figsize=(5,5), anchors=None):
+
+    if anchors is not None:
+        sizes = len(np.unique(anchors[:,2]))
+
+    
+    cols = 4
+    _, ax = plt.subplots(nrows=1, ncols=cols, figsize=figsize)
+    ax[0].set_title('GT')
+    ax[1].set_title('Predictions')
+    ax[2].set_title('CAM 1')
+    ax[3].set_title('CAM 2')
+    splits=1
+
+    sizes = len(np.unique(anchors[:,2]))
+    
+    # show prediction
+    img.show(ax=ax[1])
+    if cla1['bbox_pred'] is not None:
+        for bbox, c, scr in zip(cla1['bbox_pred'], cla1['preds'], cla1['scores']):
+            draw_circle(ax[1], [bbox[1],bbox[0],bbox[2]], text=f'{scr:.2f}') 
+
+    if cla2['bbox_pred'] is not None:
+        for bbox, c, scr in zip(cla2['bbox_pred'], cla2['preds'], cla2['scores']):
+            draw_circle(ax[1], [bbox[1],bbox[0],bbox[2]], text=f'{scr:.2f}', color='blue', yoffset=20) 
+
+                
+                
+    # show gt
+    img.show(ax=ax[0])
+    for bbox, c in zip(bbox_gt, class_gt):
+        draw_circle(ax[0], [bbox[1],bbox[0],bbox[2]], text=f'mit') 
+
+    pred_act = cla1['clas_pred_orig'][:,0] # only CAM for active class, not for BG
+    newshape=np.int16(np.sqrt(anchors.shape[0]/splits/sizes)),np.int16(np.sqrt(anchors.shape[0]/splits/sizes))
+
+    for i in range(sizes):
+            im = ax[i+2].imshow(np.reshape(pred_act[i::sizes], newshape=newshape), vmin=0, vmax=1)
+            plt.colorbar(im, ax=ax[i+2])
+
+    pred_act = cla2['clas_pred_orig'][:,0] # only CAM for active class, not for BG
+    newshape=np.int16(np.sqrt(anchors.shape[0]/splits/sizes)),np.int16(np.sqrt(anchors.shape[0]/splits/sizes))
+
+    for i in range(sizes):
+            im = ax[i+3].imshow(np.reshape(pred_act[i::sizes], newshape=newshape), vmin=0, vmax=1)
+            plt.colorbar(im, ax=ax[i+3])
+
+                
+            
+def process_output(clas_pred, bbox_pred, anchors, detect_thresh=0.25, use_sigmoid=True):
     bbox_pred = activ_to_bbox(bbox_pred, anchors.to(clas_pred.device))
-    clas_pred = torch.sigmoid(clas_pred)
 
+    if (use_sigmoid):
+        clas_pred = torch.sigmoid(clas_pred)
+
+    clas_pred_orig = clas_pred.clone()
     detect_mask = clas_pred.max(1)[0] > detect_thresh
     if np.array(detect_mask).max() == 0:
-        return None, None, None
+        return {'bbox_pred':None, 'scores':None, 'preds':None, 'clas_pred':clas_pred,'clas_pred_orig': clas_pred_orig, 'detect_mask': detect_mask}
 
     bbox_pred, clas_pred = bbox_pred[detect_mask], clas_pred[detect_mask]
-    bbox_pred = tlbr2cthw(torch.clamp(cthw2tlbr(bbox_pred), min=-1, max=1))
+    if (bbox_pred.shape[-1] == 4):
+        bbox_pred = tlbr2cthw(torch.clamp(cthw2tlbr(bbox_pred), min=-1, max=1))
+    else:
+        bbox_pred = bbox_pred# torch.clamp(bbox_pred, min=-1, max=1)
+
+        
     scores, preds = clas_pred.max(1)
-    return bbox_pred, scores, preds
+    return {'bbox_pred':bbox_pred, 'scores':scores, 'preds':preds, 'clas_pred':clas_pred, 'clas_pred_orig': clas_pred_orig, 'detect_mask': detect_mask}
 
 
 def rescale_boxes(bboxes, t_sz: Tensor):
-
-    bboxes[:, 2:] = bboxes[:, 2:] * t_sz / 2
-    bboxes[:, :2] = (bboxes[:, :2] + 1) * t_sz / 2
+    t_sz = t_sz.to(bboxes.device)
+    if (bboxes.shape[-1] == 4):
+        bboxes[:, 2:] = bboxes[:, 2:] * t_sz / 2
+        bboxes[:, :2] = (bboxes[:, :2] + 1) * t_sz / 2
+    else:
+        bboxes[:, 2:] = bboxes[:, 2:] * t_sz[...,0] / 2
+        bboxes[:, :2] = (bboxes[:, :2] + 1) * t_sz / 2
 
     return bboxes
 
@@ -256,7 +451,8 @@ def show_anchors_on_images(data, anchors, figsize=(15,15)):
         # 0=not found; 1=found; found 2=anchor
         processed_boxes = []
         processed_labels = []
-        for gt_box in tlbr2cthw(bboxes[labels > 0]):
+            
+        for gt_box in tlbr2cthw(bboxes[labels > 0]) if (bboxes.shape[-1]==4) else bboxes[labels > 0]:
             matches = match_anchors(anchors, gt_box[None, :])
             bbox_mask = matches >= 0
             if bbox_mask.sum() != 0:
@@ -275,7 +471,7 @@ def show_anchors_on_images(data, anchors, figsize=(15,15)):
                 processed_boxes.append(to_np(best_fitting_anchor))
                 processed_labels.append(1)
 
-        all_boxes.extend(processed_boxes)
+        all_boxes.extend(processed_boxes) 
         all_labels.extend(processed_labels)
 
         processed_boxes = np.array(processed_boxes)
@@ -286,18 +482,26 @@ def show_anchors_on_images(data, anchors, figsize=(15,15)):
         ax[1].set_title("No match")
 
         if sum(processed_labels == 2) > 0:
-            imageBB = ImageBBox.create(*image.size, cthw2tlbr(tensor(processed_boxes[processed_labels > 1])),
-                                           labels=processed_labels[processed_labels > 1],
-                                           classes=["", "", "Match", "Anchor"], scale=False)
+            if (processed_boxes.shape[-1] == 4):
+                imageBB = ImageBBox.create(*image.size, cthw2tlbr(tensor(processed_boxes[processed_labels > 1])),
+                                               labels=processed_labels[processed_labels > 1],
+                                               classes=["", "", "Match", "Anchor"], scale=False)
+            else:
+                imageBB = BoundingCircleObject.create(*image.size, processed_boxes[processed_labels > 1], processed_labels[processed_labels>1], classes=["","","Match","Anchor"], scale=False)
 
+                
             image.show(ax=ax[0], y=imageBB)
         else:
             image.show(ax=ax[0])
 
         if sum(processed_labels == 0) > 0:
-            imageBBNoMatch = ImageBBox.create(*image.size, cthw2tlbr(tensor(processed_boxes[processed_labels <= 1])),
-                                                  labels=processed_labels[processed_labels <= 1],
-                                                  classes=["No Match", "Anchor"], scale=False)
+            if (processed_boxes.shape[-1] == 4):
+                imageBBNoMatch = ImageBBox.create(*image.size, cthw2tlbr(tensor(processed_boxes[processed_labels <= 1])),
+                                                      labels=processed_labels[processed_labels <= 1],
+                                                      classes=["No Match", "Anchor"], scale=False)
+            else:
+                imageBBNoMatch = BoundingCircleObject.create(*image.size, processed_boxes[processed_labels <= 1], processed_labels[processed_labels<=1], classes=["","","No Match","Anchor"], scale=False)
+
             image.show(ax=ax[1], y=imageBBNoMatch)
         else:
             image.show(ax=ax[1])
